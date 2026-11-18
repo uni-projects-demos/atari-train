@@ -17,24 +17,27 @@ const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 pub struct Metadata {
     pub format_version: u32,
     pub config: RunConfig,
-    pub dueling: bool,
-    pub repair_reset_padding: bool,
+    #[serde(alias = "dueling")]
+    pub is_dueling: bool,
+    #[serde(alias = "repair_reset_padding")]
+    pub is_repair_reset_padding: bool,
     pub training_step: u64,
-    pub source: Option<String>,
+    #[serde(alias = "source")]
+    pub src: Option<String>,
 }
 
 impl Metadata {
     pub fn fresh(cfg: RunConfig) -> Self {
-        let dueling: bool = cfg.training.dueling;
-        let repair_reset_padding: bool = cfg.game.padding == crate::config::Padding::Repeat
+        let is_dueling: bool = cfg.training.is_dueling;
+        let is_repair_reset_padding: bool = cfg.game.padding == crate::config::Padding::Repeat
             && ["pong", "breakout"].contains(&cfg.game.key.as_str());
         Self {
             format_version: 1,
             config: cfg,
-            dueling,
-            repair_reset_padding,
+            is_dueling,
+            is_repair_reset_padding,
             training_step: 0,
-            source: None,
+            src: None,
         }
     }
 }
@@ -53,7 +56,7 @@ pub fn save_weights(path: &Path, weights: &Weights, meta: &Metadata) -> Result<(
         .iter()
         .map(|(name, weight)| {
             let bytes: Vec<u8> = weight
-                .values
+                .vals
                 .iter()
                 .flat_map(|val: &f32| val.to_le_bytes())
                 .collect();
@@ -96,7 +99,7 @@ pub fn read(path: &Path) -> Result<(Metadata, Weights)> {
     ensure!(meta.format_version == 1, "Unsupported checkpoint format");
     meta.config.validate()?;
     ensure!(
-        meta.dueling == meta.config.training.dueling,
+        meta.is_dueling == meta.config.training.is_dueling,
         "Checkpoint head metadata is inconsistent"
     );
     let wts: Weights = read_weights(&data)?;
@@ -105,7 +108,13 @@ pub fn read(path: &Path) -> Result<(Metadata, Weights)> {
 
 pub fn load(path: &Path, dev: &Device) -> Result<(Metadata, DQN)> {
     let (meta, wts): (Metadata, Weights) = read(path)?;
-    let model: DQN = DQN::new(&meta.config.game, meta.dueling, dev).load(&wts, dev)?;
+    let model: DQN = DQN::new_algo(
+        &meta.config.game,
+        meta.config.training.alg,
+        meta.is_dueling,
+        dev,
+    )
+    .load(&wts, dev)?;
     Ok((meta, model))
 }
 
@@ -131,7 +140,7 @@ pub fn read_weights(data: &[u8]) -> Result<Weights> {
             name,
             Weight {
                 shape: tensor.shape().to_vec(),
-                values: vals,
+                vals,
             },
         );
     }

@@ -1,16 +1,16 @@
 use anyhow::{Context, Result, ensure};
-use burn::prelude::*;
-use clap::{Parser, Subcommand, ValueEnum};
-use atari_train_dqn::{
+use atari_train::{
     checkpoint::{self, Metadata},
-    config::{self, FRAME_HEIGHT, FRAME_STACK, FRAME_WIDTH, Padding, RunConfig},
-    evaluate::Evaluation,
+    config::{self, Alg, FRAME_HEIGHT, FRAME_STACK, FRAME_WIDTH, Padding, RunConfig},
+    eval::Eval,
     model::{DQN, Weights},
     preprocess::FrameHistory,
     replay::ReplayMemory,
     state::State,
     train::TrainingResult,
 };
+use burn::prelude::*;
+use clap::{Parser, Subcommand, ValueEnum};
 use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 use std::{
@@ -18,13 +18,10 @@ use std::{
     time::Instant,
 };
 
-const PRESET_DIRECTORY: &str = "configs";
+const PRESET_DIR: &str = "configs";
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Deep-RL training and evaluation using ALE environments and DQN-based agents for Atari games."
-)]
+#[command(version, about = "Atari deep RL: DQN, Rainbow-C51, IQN and PPO.")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -56,6 +53,25 @@ impl Backend {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum AlgChoice {
+    Dqn,
+    Rainbow,
+    Iqn,
+    Ppo,
+}
+
+impl From<AlgChoice> for Alg {
+    fn from(val: AlgChoice) -> Self {
+        match val {
+            AlgChoice::Dqn => Self::Dqn,
+            AlgChoice::Rainbow => Self::Rainbow,
+            AlgChoice::Iqn => Self::Iqn,
+            AlgChoice::Ppo => Self::Ppo,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     List,
@@ -72,12 +88,14 @@ enum Command {
         output: Option<PathBuf>,
     },
     Train {
-        #[arg(long, conflicts_with_all = ["config", "all"])]
+        #[arg(long, conflicts_with_all = ["config", "is_all"])]
         game: Option<String>,
-        #[arg(long, conflicts_with_all = ["game", "all"])]
+        #[arg(long, conflicts_with_all = ["game", "is_all"])]
         config: Option<PathBuf>,
-        #[arg(long)]
-        all: bool,
+        #[arg(long = "all")]
+        is_all: bool,
+        #[arg(long = "alg", visible_alias = "algorithm", value_enum)]
+        alg: Option<AlgChoice>,
         #[arg(long)]
         steps: Option<u64>,
         #[arg(long)]
@@ -99,7 +117,8 @@ enum Command {
         #[arg(long)]
         init: Option<PathBuf>,
     },
-    Evaluate {
+    #[command(visible_alias = "evaluate")]
+    Eval {
         #[arg(long)]
         checkpoint: PathBuf,
         #[arg(long, default_value_t = 42)]
@@ -118,8 +137,8 @@ enum Command {
         checkpoint: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long)]
-        q_values: bool,
+        #[arg(long = "q-vals", visible_alias = "q-values")]
+        is_q_vals: bool,
     },
     Import {
         #[arg(long)]
@@ -140,8 +159,12 @@ enum Command {
         output: PathBuf,
     },
     ReplayBenchmark {
-        #[arg(long, default_value_t = 10_000)]
-        transitions: usize,
+        #[arg(
+            long = "trans",
+            visible_alias = "transitions",
+            default_value_t = 10_000
+        )]
+        trans: usize,
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -168,7 +191,7 @@ fn main() -> Result<()> {
                 println!(
                     "{key:14} actions={:2} arena={}",
                     cfg.game.actions.len(),
-                    cfg.game.arena_compatible()
+                    cfg.game.is_arena_compatible()
                 );
             }
         }
@@ -182,7 +205,7 @@ fn main() -> Result<()> {
             } else {
                 RunConfig::load_preset(
                     game.as_deref().expect("clap requires game or checkpoint"),
-                    Path::new(PRESET_DIRECTORY),
+                    Path::new(PRESET_DIR),
                 )?
             };
             if let Some(path) = output {
@@ -194,7 +217,8 @@ fn main() -> Result<()> {
         Command::Train {
             game,
             config: cfg_path,
-            all,
+            is_all,
+            alg,
             steps,
             envs,
             seed,
@@ -206,7 +230,7 @@ fn main() -> Result<()> {
             device: backend,
             init,
         } => {
-            let names: Vec<String> = if all {
+            let names: Vec<String> = if is_all {
                 config::GAMES
                     .iter()
                     .map(|name: &&str| (*name).to_owned())
@@ -214,14 +238,17 @@ fn main() -> Result<()> {
             } else {
                 vec![game.unwrap_or_else(|| "pong".to_owned())]
             };
-            ensure!(!all || init.is_none(), "--init belongs to one game");
+            ensure!(!is_all || init.is_none(), "--init belongs to one game");
 
             for name in names {
                 let mut cfg: RunConfig = if let Some(path) = &cfg_path {
                     RunConfig::load(path)?
                 } else {
-                    RunConfig::load_preset(&name, Path::new(PRESET_DIRECTORY))?
+                    RunConfig::load_preset(&name, Path::new(PRESET_DIR))?
                 };
+                if let Some(alg) = alg {
+                    cfg.training.alg = alg.into();
+                }
                 if let Some(val) = steps {
                     cfg.training.steps = val;
                 }
@@ -238,10 +265,10 @@ fn main() -> Result<()> {
                     cfg.training.learning_starts = val;
                 }
                 if let Some(val) = eval_steps {
-                    cfg.training.evaluation_max_steps = val;
+                    cfg.training.eval_max_steps = val;
                 }
                 if let Some(val) = eval_episodes {
-                    cfg.training.evaluation_episodes = val;
+                    cfg.training.eval_episodes = val;
                 }
                 cfg.validate()?;
 
@@ -252,27 +279,35 @@ fn main() -> Result<()> {
                         meta.config.game.key == cfg.game.key
                             && meta.config.game.hidden == cfg.game.hidden
                             && meta.config.game.actions == cfg.game.actions
-                            && meta.config.game.minimal_actions == cfg.game.minimal_actions
+                            && meta.config.game.min_actions == cfg.game.min_actions
                             && meta.config.game.grayscale == cfg.game.grayscale
                             && meta.config.game.padding == cfg.game.padding,
                         "Warm-start game/action/preprocessing configuration differs"
                     );
                     ensure!(
-                        meta.dueling == cfg.training.dueling,
-                        "Warm-start head differs: set dueling to match checkpoint"
+                        meta.is_dueling == cfg.training.is_dueling
+                            && meta.config.training.alg == cfg.training.alg,
+                        "Warm-start architecture/algorithm differs from checkpoint"
                     );
                     Some(model)
                 } else {
                     None
                 };
+                let alg_name = match cfg.training.alg {
+                    Alg::Dqn => "dqn",
+                    Alg::Rainbow => "rainbow",
+                    Alg::Iqn => "iqn",
+                    Alg::Ppo => "ppo",
+                };
                 let dest: PathBuf = out
                     .join(&cfg.game.key)
-                    .join(format!("seed-{}", cfg.training.seed));
-                let result: TrainingResult = atari_train_dqn::train::train(cfg, dev, &dest, init_model)?;
+                    .join(format!("seed-{}-{alg_name}", cfg.training.seed));
+                let result: TrainingResult =
+                    atari_train::train::train(cfg, dev, &dest, init_model)?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
         }
-        Command::Evaluate {
+        Command::Eval {
             checkpoint,
             seed,
             episodes,
@@ -286,22 +321,21 @@ fn main() -> Result<()> {
             );
             let dev: Device = backend.device()?;
             let (meta, model): (Metadata, DQN) = checkpoint::load(&checkpoint, &dev)?;
-            let result: Evaluation =
-                atari_train_dqn::evaluate::evaluate(&model, &meta.config.game, seed, episodes, max_steps)?;
+            let result: Eval =
+                atari_train::eval::eval(&model, &meta.config.game, seed, episodes, max_steps)?;
             write_json(report.as_deref(), &result)?;
         }
         Command::Export {
             checkpoint,
             output,
-            q_values,
+            is_q_vals,
         } => {
-            let (meta, model): (Metadata, DQN) =
-                checkpoint::load(&checkpoint, &Device::flex())?;
-            atari_train_dqn::onnx::export(&output, &model, &meta, q_values)?;
+            let (meta, model): (Metadata, DQN) = checkpoint::load(&checkpoint, &Device::flex())?;
+            atari_train::onnx::export(&output, &model, &meta, is_q_vals)?;
             println!(
                 "Exported {} (arena compatible: {})",
                 output.display(),
-                meta.config.game.arena_compatible()
+                meta.config.game.is_arena_compatible()
             );
         }
         Command::Import { input, output } => {
@@ -311,10 +345,13 @@ fn main() -> Result<()> {
             struct Legacy {
                 game: String,
                 actions: Vec<usize>,
-                source: String,
-                source_sha256: String,
+                #[serde(alias = "source")]
+                src: String,
+                #[serde(alias = "source_sha256")]
+                src_sha256: String,
                 training_step: u64,
-                environment: String,
+                #[serde(alias = "environment")]
+                env: String,
             }
             let legacy: Legacy = serde_json::from_str(
                 header
@@ -326,12 +363,12 @@ fn main() -> Result<()> {
             let wts: Weights = checkpoint::read_weights(&data)?;
             let mut cfg: RunConfig = RunConfig::named(&legacy.game)?;
             cfg.game.actions = legacy.actions;
-            cfg.training.dueling = false;
+            cfg.training.is_dueling = false;
             cfg.training.n_step = 1;
             cfg.game.padding = Padding::Repeat;
-            cfg.game.max_pool = false;
+            cfg.game.is_max_pool = false;
             cfg.game.noop_frame_skip = 4;
-            cfg.game.sticky_probability = 0.25;
+            cfg.game.sticky_prob = 0.25;
             cfg.game.reset_actions.clear();
             cfg.validate()?;
 
@@ -340,12 +377,12 @@ fn main() -> Result<()> {
             let meta: Metadata = Metadata {
                 format_version: 1,
                 config: cfg,
-                dueling: false,
-                repair_reset_padding: true,
+                is_dueling: false,
+                is_repair_reset_padding: true,
                 training_step: legacy.training_step,
-                source: Some(format!(
+                src: Some(format!(
                     "{}; SHA256 {}; original environment {}; historical optimizer/replay state not supplied",
-                    legacy.source, legacy.source_sha256, legacy.environment
+                    legacy.src, legacy.src_sha256, legacy.env
                 )),
             };
             checkpoint::save(&output, &model, &meta)?;
@@ -353,7 +390,7 @@ fn main() -> Result<()> {
         }
         Command::Inspect { checkpoint } => {
             let (meta, wts) = checkpoint::read(&checkpoint)?;
-            let parameters: usize = wts.values().map(|weight| weight.values.len()).sum();
+            let parameters: usize = wts.values().map(|weight| weight.vals.len()).sum();
             let tensors: Vec<serde_json::Value> = wts
                 .iter()
                 .map(|(name, weight)| serde_json::json!({"name": name, "shape": weight.shape}))
@@ -374,7 +411,8 @@ fn main() -> Result<()> {
         } => {
             #[derive(Deserialize)]
             struct Input {
-                values: Vec<f32>,
+                #[serde(alias = "values")]
+                vals: Vec<f32>,
             }
 
             let dev: Device = Device::flex();
@@ -383,34 +421,28 @@ fn main() -> Result<()> {
             let shape: [usize; 3] = meta.config.game.shape();
             let elems: usize = shape.iter().product();
             ensure!(
-                !data.values.is_empty()
-                    && data.values.len().is_multiple_of(elems)
-                    && data.values.iter().all(|val: &f32| val.is_finite()),
+                !data.vals.is_empty()
+                    && data.vals.len().is_multiple_of(elems)
+                    && data.vals.iter().all(|val: &f32| val.is_finite()),
                 "Invalid input dimensions/values"
             );
-            let batch: usize = data.values.len() / elems;
+            let batch: usize = data.vals.len() / elems;
             let frame_elems: usize = FRAME_WIDTH * FRAME_HEIGHT;
-            if meta.repair_reset_padding {
-                for obs in data.values.chunks_exact_mut(elems) {
+            if meta.is_repair_reset_padding {
+                for obs in data.vals.chunks_exact_mut(elems) {
                     for channel in (0..FRAME_STACK - 1).rev() {
                         let start: usize = channel * frame_elems;
                         if obs[start..start + frame_elems]
                             .iter()
                             .all(|&val: &f32| val == 0.0)
                         {
-                            obs.copy_within(
-                                start + frame_elems..start + 2 * frame_elems,
-                                start,
-                            );
+                            obs.copy_within(start + frame_elems..start + 2 * frame_elems, start);
                         }
                     }
                 }
             }
             let tensor: Tensor<4> = Tensor::from_data(
-                TensorData::new(
-                    data.values,
-                    [batch, FRAME_STACK, FRAME_HEIGHT, FRAME_WIDTH],
-                ),
+                TensorData::new(data.vals, [batch, FRAME_STACK, FRAME_HEIGHT, FRAME_WIDTH]),
                 &dev,
             );
             let vals: Vec<f32> = model
@@ -426,9 +458,7 @@ fn main() -> Result<()> {
                         .iter()
                         .enumerate()
                         .max_by(|left, right| {
-                            left.1
-                                .total_cmp(right.1)
-                                .then_with(|| right.0.cmp(&left.0))
+                            left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0))
                         })
                         .expect("actions nonempty")
                         .0;
@@ -440,23 +470,20 @@ fn main() -> Result<()> {
                 &serde_json::json!({"batch": batch, "q_values": vals, "actions": actions}),
             )?;
         }
-        Command::ReplayBenchmark {
-            transitions,
-            output,
-        } => {
+        Command::ReplayBenchmark { trans, output } => {
             ensure!(
-                transitions > 32 && transitions <= 100_000,
+                trans > 32 && trans <= 100_000,
                 "Benchmark count must be 33..100000"
             );
             let mut hist: FrameHistory = FrameHistory::new(Padding::Zero);
             let frame_elems: usize = FRAME_WIDTH * FRAME_HEIGHT;
             let mut prev: State = hist.push(vec![1_u8; frame_elems].into());
-            let mut replay: ReplayMemory = ReplayMemory::new(transitions, 0.5);
+            let mut replay: ReplayMemory = ReplayMemory::new(trans, 0.5);
             let start: Instant = Instant::now();
-            for idx in 0..transitions {
+            for idx in 0..trans {
                 let px: u8 = u8::try_from(idx % 254 + 1).expect("pixel value fits u8");
                 let next: State = hist.push(vec![px; frame_elems].into());
-                replay.push(atari_train_dqn::replay::Transition {
+                replay.push(atari_train::replay::Tran {
                     state: prev,
                     action: 0,
                     reward: 1.0,
@@ -465,23 +492,23 @@ fn main() -> Result<()> {
                 });
                 prev = next;
             }
-            let fill_seconds: f64 = start.elapsed().as_secs_f64();
+            let fill_secs: f64 = start.elapsed().as_secs_f64();
             use rand::SeedableRng;
             let mut rng: ChaCha8Rng = ChaCha8Rng::seed_from_u64(42);
             let start: Instant = Instant::now();
             for _ in 0..1_000 {
                 std::hint::black_box(replay.sample(32, 0.4, &mut rng));
             }
-            let sample_seconds: f64 = start.elapsed().as_secs_f64().max(f64::EPSILON);
+            let sample_secs: f64 = start.elapsed().as_secs_f64().max(f64::EPSILON);
             write_json(
                 output.as_deref(),
                 &serde_json::json!({
-                    "transitions": transitions,
-                    "estimated_unique_frame_bytes": (transitions + 2) * frame_elems,
-                    "full_uint8_stacks_bytes": transitions * 2 * FRAME_STACK * frame_elems,
-                    "full_float32_stacks_bytes": transitions * 2 * FRAME_STACK * frame_elems * 4,
-                    "fill_seconds": fill_seconds,
-                    "sample_batches_per_second": 1_000.0 / sample_seconds,
+                    "transitions": trans,
+                    "estimated_unique_frame_bytes": (trans + 2) * frame_elems,
+                    "full_uint8_stacks_bytes": trans * 2 * FRAME_STACK * frame_elems,
+                    "full_float32_stacks_bytes": trans * 2 * FRAME_STACK * frame_elems * 4,
+                    "fill_seconds": fill_secs,
+                    "sample_batches_per_second": 1_000.0 / sample_secs,
                     "note": "Pixel payload comparison; excludes Arc/transition/priority-tree overhead and is not an RSS measurement"
                 }),
             )?;

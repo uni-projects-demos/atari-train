@@ -2,10 +2,10 @@ use crate::state::State;
 use rand::{Rng, RngExt};
 use std::collections::VecDeque;
 
-const PRIORITY_EPSILON: f32 = 1e-5;
+const PRIORITY_EPS: f32 = 1e-5;
 
 #[derive(Clone, Debug)]
-pub struct Transition {
+pub struct Tran {
     pub state: State,
     pub action: usize,
     pub reward: f32,
@@ -14,17 +14,17 @@ pub struct Transition {
 }
 
 #[derive(Clone)]
-pub struct RawTransition {
+pub struct RawTran {
     pub state: State,
     pub action: usize,
     pub reward: f32,
     pub next: State,
-    pub terminated: bool,
-    pub episode_end: bool,
+    pub is_terminated: bool,
+    pub is_episode_end: bool,
 }
 
 pub struct NStep {
-    pending: VecDeque<RawTransition>,
+    pending: VecDeque<RawTran>,
     n: usize,
     gamma: f32,
 }
@@ -40,26 +40,26 @@ impl NStep {
         }
     }
 
-    pub fn push(&mut self, transition: RawTransition) -> Vec<Transition> {
-        let episode_end: bool = transition.episode_end;
-        self.pending.push_back(transition);
-        let mut out: Vec<Transition> = Vec::new();
-        while self.pending.len() >= self.n || episode_end && !self.pending.is_empty() {
+    pub fn push(&mut self, tran: RawTran) -> Vec<Tran> {
+        let is_episode_end: bool = tran.is_episode_end;
+        self.pending.push_back(tran);
+        let mut out: Vec<Tran> = Vec::new();
+        while self.pending.len() >= self.n || is_episode_end && !self.pending.is_empty() {
             let horizon: usize = self.n.min(self.pending.len());
-            let first: &RawTransition = &self.pending[0];
+            let first: &RawTran = &self.pending[0];
             let mut reward: f32 = 0.0;
             let mut discount: f32 = 1.0;
-            let mut last: &RawTransition = first;
+            let mut last: &RawTran = first;
             for item in self.pending.iter().take(horizon) {
                 reward += discount * item.reward;
                 discount *= self.gamma;
                 last = item;
-                if item.terminated {
+                if item.is_terminated {
                     discount = 0.0;
                     break;
                 }
             }
-            out.push(Transition {
+            out.push(Tran {
                 state: first.state.clone(),
                 action: first.action,
                 reward,
@@ -73,13 +73,13 @@ impl NStep {
 }
 
 pub struct Sample {
-    pub transitions: Vec<Transition>,
+    pub trans: Vec<Tran>,
     pub idxs: Vec<usize>,
     pub weights: Vec<f32>,
 }
 
 pub struct ReplayMemory {
-    entries: Vec<Option<Transition>>,
+    entries: Vec<Option<Tran>>,
     tree: Vec<f32>,
     base: usize,
     pos: usize,
@@ -112,8 +112,8 @@ impl ReplayMemory {
         self.len == 0
     }
 
-    pub fn push(&mut self, transition: Transition) {
-        self.entries[self.pos] = Some(transition);
+    pub fn push(&mut self, tran: Tran) {
+        self.entries[self.pos] = Some(tran);
         self.set(self.pos, self.max_prio);
         self.pos = (self.pos + 1) % self.entries.len();
         self.len = (self.len + 1).min(self.entries.len());
@@ -130,7 +130,7 @@ impl ReplayMemory {
 
     pub fn update(&mut self, idxs: &[usize], errs: &[f32]) {
         for (&idx, &err) in idxs.iter().zip(errs) {
-            let priority: f32 = (err.abs() + PRIORITY_EPSILON).powf(self.alpha);
+            let priority: f32 = (err.abs() + PRIORITY_EPS).powf(self.alpha);
             if priority.is_finite() {
                 self.max_prio = self.max_prio.max(priority);
                 self.set(idx, priority);
@@ -144,7 +144,7 @@ impl ReplayMemory {
         let total: f32 = self.tree[1];
         assert!(total.is_finite() && total > 0.0);
         let mut sample: Sample = Sample {
-            transitions: Vec::with_capacity(n),
+            trans: Vec::with_capacity(n),
             idxs: Vec::with_capacity(n),
             weights: Vec::with_capacity(n),
         };
@@ -162,12 +162,10 @@ impl ReplayMemory {
                 }
             }
             let idx: usize = (tree_idx - self.base).min(self.entries.len() - 1);
-            let probability: f32 = self.tree[tree_idx] / total;
-            sample
-                .weights
-                .push((self.len as f32 * probability).powf(-beta));
+            let prob: f32 = self.tree[tree_idx] / total;
+            sample.weights.push((self.len as f32 * prob).powf(-beta));
             sample.idxs.push(idx);
-            sample.transitions.push(
+            sample.trans.push(
                 self.entries[idx]
                     .as_ref()
                     .expect("positive priority has a transition")

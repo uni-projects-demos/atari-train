@@ -1,7 +1,10 @@
 use crate::{
     checkpoint,
-    config::{FRAME_HEIGHT, FRAME_STACK, FRAME_WIDTH, GameSpec, Padding},
-    model::{CONVS, DQN, PIXEL_SCALE, Weights},
+    config::{Alg, FRAME_HEIGHT, FRAME_STACK, FRAME_WIDTH, GameSpec, Padding},
+    model::{
+        CONVS, DQN, IQN_EVAL_QUANTILES, IQN_FEATURES, PIXEL_SCALE, RAINBOW_ATOMS, RAINBOW_MAX,
+        RAINBOW_MIN, Weights,
+    },
 };
 use anyhow::Result;
 use prost::Message;
@@ -41,9 +44,9 @@ pub struct Graph {
     #[prost(message, repeated, tag = "5")]
     pub initializers: Vec<Tensor>,
     #[prost(message, repeated, tag = "11")]
-    pub inputs: Vec<Value>,
+    pub inputs: Vec<Val>,
     #[prost(message, repeated, tag = "12")]
-    pub outputs: Vec<Value>,
+    pub outputs: Vec<Val>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -87,7 +90,7 @@ pub struct Tensor {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct Value {
+pub struct Val {
     #[prost(string, tag = "1")]
     pub name: String,
     #[prost(message, optional, tag = "2")]
@@ -117,11 +120,11 @@ pub struct Shape {
 #[derive(Clone, PartialEq, Message)]
 pub struct Dimension {
     #[prost(int64, tag = "1")]
-    pub value: i64,
+    pub val: i64,
 }
 
-fn value(name: &str, dtype: i32, shape: &[usize]) -> Value {
-    Value {
+fn val(name: &str, dtype: i32, shape: &[usize]) -> Val {
+    Val {
         name: name.to_owned(),
         kind: Some(Type {
             tensor: Some(TensorType {
@@ -130,7 +133,7 @@ fn value(name: &str, dtype: i32, shape: &[usize]) -> Value {
                     dims: shape
                         .iter()
                         .map(|&dim: &usize| Dimension {
-                            value: i64::try_from(dim).expect("ONNX dimension fits i64"),
+                            val: i64::try_from(dim).expect("ONNX dimension fits i64"),
                         })
                         .collect(),
                 }),
@@ -159,7 +162,10 @@ fn ints(name: &str, vals: &[i64]) -> Attribute {
 
 fn node(graph: &mut Graph, op: &str, inputs: &[&str], out: &str, attrs: Vec<Attribute>) {
     graph.nodes.push(Node {
-        inputs: inputs.iter().map(|input: &&str| (*input).to_owned()).collect(),
+        inputs: inputs
+            .iter()
+            .map(|input: &&str| (*input).to_owned())
+            .collect(),
         outputs: vec![out.to_owned()],
         name: out.to_owned(),
         op: op.to_owned(),
@@ -188,6 +194,15 @@ fn float(graph: &mut Graph, name: &str, val: f32) {
     });
 }
 
+fn floats(graph: &mut Graph, name: &str, vals: &[f32], shape: &[i64]) {
+    graph.initializers.push(Tensor {
+        name: name.to_owned(),
+        dtype: ONNX_FLOAT,
+        dims: shape.to_vec(),
+        raw: vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    });
+}
+
 fn dense(graph: &mut Graph, inp: &str, name: &str, out: &str) {
     node(
         graph,
@@ -201,12 +216,13 @@ fn dense(graph: &mut Graph, inp: &str, name: &str, out: &str) {
 pub fn graph(
     spec: &GameSpec,
     weights: &Weights,
-    dueling: bool,
-    repair: bool,
-    q_output: bool,
+    is_dueling: bool,
+    algo: Alg,
+    is_repair: bool,
+    is_q_output: bool,
 ) -> Model {
     let mut graph: Graph = Graph {
-        name: format!("{}-dqn", spec.key),
+        name: format!("{}-{:?}", spec.key, algo),
         ..Default::default()
     };
     for (name, weight) in weights {
@@ -219,7 +235,7 @@ pub fn graph(
                 .collect(),
             dtype: ONNX_FLOAT,
             raw: weight
-                .values
+                .vals
                 .iter()
                 .flat_map(|val: &f32| val.to_le_bytes())
                 .collect(),
@@ -227,10 +243,10 @@ pub fn graph(
     }
 
     let shape: [usize; 4] = [1, FRAME_STACK, FRAME_HEIGHT, FRAME_WIDTH];
-    graph.inputs.push(value("observation", ONNX_FLOAT, &shape));
+    graph.inputs.push(val("observation", ONNX_FLOAT, &shape));
     let mut inp: String = "observation".to_owned();
 
-    if repair && spec.padding == Padding::Repeat {
+    if is_repair && spec.padding == Padding::Repeat {
         integer(&mut graph, "axis_channel", &[1]);
         integer(&mut graph, "axis_spatial", &[2, 3]);
         float(&mut graph, "zero", 0.0);
@@ -332,35 +348,210 @@ pub fn graph(
         "hidden_relu",
         Vec::new(),
     );
-    dense(
-        &mut graph,
-        "hidden_relu",
-        "output",
-        if dueling { "advantage" } else { "q_values" },
-    );
-    if dueling {
-        dense(&mut graph, "hidden_relu", "value", "state_value");
-        node(
-            &mut graph,
-            "ReduceMean",
-            &["advantage"],
-            "advantage_mean",
-            vec![ints("axes", &[1]), int("keepdims", 1)],
-        );
-        node(
-            &mut graph,
-            "Sub",
-            &["advantage", "advantage_mean"],
-            "centered_advantage",
-            Vec::new(),
-        );
-        node(
-            &mut graph,
-            "Add",
-            &["state_value", "centered_advantage"],
-            "q_values",
-            Vec::new(),
-        );
+    match algo {
+        Alg::Dqn => {
+            dense(
+                &mut graph,
+                "hidden_relu",
+                "output",
+                if is_dueling { "advantage" } else { "q_values" },
+            );
+            if is_dueling {
+                dense(&mut graph, "hidden_relu", "value", "state_value");
+                node(
+                    &mut graph,
+                    "ReduceMean",
+                    &["advantage"],
+                    "advantage_mean",
+                    vec![ints("axes", &[1]), int("keepdims", 1)],
+                );
+                node(
+                    &mut graph,
+                    "Sub",
+                    &["advantage", "advantage_mean"],
+                    "centered_advantage",
+                    vec![],
+                );
+                node(
+                    &mut graph,
+                    "Add",
+                    &["state_value", "centered_advantage"],
+                    "q_values",
+                    vec![],
+                );
+            }
+        }
+        Alg::Rainbow => {
+            let actions = spec.actions.len();
+            integer(
+                &mut graph,
+                "rainbow_shape",
+                &[1, actions as i64, RAINBOW_ATOMS as i64],
+            );
+            dense(&mut graph, "hidden_relu", "output", "distribution_flat");
+            node(
+                &mut graph,
+                "Reshape",
+                &["distribution_flat", "rainbow_shape"],
+                "advantage_atoms",
+                vec![],
+            );
+            let logits = if is_dueling {
+                dense(&mut graph, "hidden_relu", "value", "value_atoms_flat");
+                integer(&mut graph, "value_shape", &[1, 1, RAINBOW_ATOMS as i64]);
+                node(
+                    &mut graph,
+                    "Reshape",
+                    &["value_atoms_flat", "value_shape"],
+                    "value_atoms",
+                    vec![],
+                );
+                node(
+                    &mut graph,
+                    "ReduceMean",
+                    &["advantage_atoms"],
+                    "mean_advantage_atoms",
+                    vec![ints("axes", &[1]), int("keepdims", 1)],
+                );
+                node(
+                    &mut graph,
+                    "Sub",
+                    &["advantage_atoms", "mean_advantage_atoms"],
+                    "centered_atoms",
+                    vec![],
+                );
+                node(
+                    &mut graph,
+                    "Add",
+                    &["value_atoms", "centered_atoms"],
+                    "distribution_logits",
+                    vec![],
+                );
+                "distribution_logits"
+            } else {
+                "advantage_atoms"
+            };
+            node(
+                &mut graph,
+                "Softmax",
+                &[logits],
+                "distribution_probs",
+                vec![int("axis", 2)],
+            );
+            let support: Vec<f32> = (0..RAINBOW_ATOMS)
+                .map(|i| {
+                    RAINBOW_MIN
+                        + (RAINBOW_MAX - RAINBOW_MIN) * i as f32 / (RAINBOW_ATOMS - 1) as f32
+                })
+                .collect();
+            floats(
+                &mut graph,
+                "rainbow_support",
+                &support,
+                &[1, 1, RAINBOW_ATOMS as i64],
+            );
+            node(
+                &mut graph,
+                "Mul",
+                &["distribution_probs", "rainbow_support"],
+                "weighted_atoms",
+                vec![],
+            );
+            node(
+                &mut graph,
+                "ReduceSum",
+                &["weighted_atoms"],
+                "q_values",
+                vec![ints("axes", &[2]), int("keepdims", 0)],
+            );
+        }
+        Alg::Iqn => {
+            let n = IQN_EVAL_QUANTILES;
+            let actions = spec.actions.len();
+            let mut cosines = Vec::with_capacity(n * IQN_FEATURES);
+            for i in 0..n {
+                let tau = (i as f32 + 0.5) / n as f32;
+                for k in 1..=IQN_FEATURES {
+                    cosines.push((std::f32::consts::PI * k as f32 * tau).cos());
+                }
+            }
+            floats(
+                &mut graph,
+                "iqn_cosines",
+                &cosines,
+                &[n as i64, IQN_FEATURES as i64],
+            );
+            dense(&mut graph, "iqn_cosines", "quantile", "quantile_embed_raw");
+            node(
+                &mut graph,
+                "Relu",
+                &["quantile_embed_raw"],
+                "quantile_embed",
+                vec![],
+            );
+            node(
+                &mut graph,
+                "Mul",
+                &["hidden_relu", "quantile_embed"],
+                "quantile_features",
+                vec![],
+            );
+            dense(
+                &mut graph,
+                "quantile_features",
+                "output",
+                if is_dueling {
+                    "quantile_adv"
+                } else {
+                    "quantile_logits"
+                },
+            );
+            let logits = if is_dueling {
+                dense(&mut graph, "quantile_features", "value", "quantile_value");
+                node(
+                    &mut graph,
+                    "ReduceMean",
+                    &["quantile_adv"],
+                    "quantile_adv_mean",
+                    vec![ints("axes", &[1]), int("keepdims", 1)],
+                );
+                node(
+                    &mut graph,
+                    "Sub",
+                    &["quantile_adv", "quantile_adv_mean"],
+                    "quantile_adv_centered",
+                    vec![],
+                );
+                node(
+                    &mut graph,
+                    "Add",
+                    &["quantile_value", "quantile_adv_centered"],
+                    "quantile_logits",
+                    vec![],
+                );
+                "quantile_logits"
+            } else {
+                "quantile_logits"
+            };
+            integer(&mut graph, "iqn_shape", &[1, n as i64, actions as i64]);
+            node(
+                &mut graph,
+                "Reshape",
+                &[logits, "iqn_shape"],
+                "all_quantiles",
+                vec![],
+            );
+            node(
+                &mut graph,
+                "ReduceMean",
+                &["all_quantiles"],
+                "q_values",
+                vec![ints("axes", &[1]), int("keepdims", 0)],
+            );
+        }
+        Alg::Ppo => {
+            dense(&mut graph, "hidden_relu", "output", "q_values");
+        }
     }
 
     node(
@@ -383,11 +574,11 @@ pub fn graph(
         "action",
         vec![int("axis", 0)],
     );
-    graph.outputs.push(value("action", ONNX_INT64, &[1]));
-    if q_output {
+    graph.outputs.push(val("action", ONNX_INT64, &[1]));
+    if is_q_output {
         graph
             .outputs
-            .push(value("q_values", ONNX_FLOAT, &[1, spec.actions.len()]));
+            .push(val("q_values", ONNX_FLOAT, &[1, spec.actions.len()]));
     }
 
     Model {
@@ -405,31 +596,37 @@ pub fn export(
     path: &Path,
     model: &DQN,
     meta: &checkpoint::Metadata,
-    q_output: bool,
+    is_q_output: bool,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    anyhow::ensure!(
+        meta.config.training.alg != Alg::Ppo || !is_q_output,
+        "PPO exports action logits, not Q values; omit --q-values"
+    );
     let graph: Model = graph(
         &meta.config.game,
         &model.weights()?,
-        meta.dueling,
-        meta.repair_reset_padding,
-        q_output,
+        meta.is_dueling,
+        meta.config.training.alg,
+        meta.is_repair_reset_padding,
+        is_q_output,
     );
     std::fs::write(path, graph.encode_to_vec())?;
 
     let spec: &GameSpec = &meta.config.game;
     let sidecar: serde_json::Value = serde_json::json!({
         "game": spec.key,
-        "arena_compatible": spec.arena_compatible(),
+        "algorithm": meta.config.training.alg,
+        "arena_compatible": spec.is_arena_compatible(),
         "input": "observation",
         "output": "action",
         "shape": [1, FRAME_STACK, FRAME_HEIGHT, FRAME_WIDTH],
         "actions": spec.actions,
         "padding": spec.padding,
         "grayscale_order": spec.grayscale,
-        "repair_reset_padding": meta.repair_reset_padding,
+        "repair_reset_padding": meta.is_repair_reset_padding,
         "normalization": "raw float32 pixels; divide by 255 inside ONNX",
         "checkpoint": meta,
         "training_performance_claim": "See measured evaluation reports; export is not evidence of game skill"

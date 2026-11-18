@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::path::Path;
 
 #[derive(Clone, Copy)]

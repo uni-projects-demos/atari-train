@@ -1,12 +1,12 @@
 use crate::{
     agent::{Agent, beta},
     checkpoint::{self, Metadata},
-    config::{GameSpec, RunConfig, TrainingConfig},
+    config::{Alg, GameSpec, RunConfig, TrainingConfig},
     env,
-    evaluate::{self, Episode, Evaluation},
+    eval::{self, Episode, Eval},
     model::DQN,
     onnx,
-    replay::{NStep, RawTransition, ReplayMemory, Sample, Transition},
+    replay::{NStep, RawTran, ReplayMemory, Sample, Tran},
     state::State,
 };
 use anyhow::Result;
@@ -23,7 +23,7 @@ use std::{
 };
 
 struct Worker {
-    env: Box<dyn env::Environment>,
+    env: Box<dyn env::Env>,
     state: State,
     ep_return: f32,
     ep_steps: u64,
@@ -36,11 +36,14 @@ pub struct TrainingResult {
     pub decisions: u64,
     pub updates: u64,
     pub episodes: u64,
-    pub wall_seconds: f64,
-    pub decisions_per_second: f64,
+    #[serde(alias = "wall_seconds")]
+    pub wall_secs: f64,
+    #[serde(alias = "decisions_per_second")]
+    pub decisions_per_sec: f64,
     pub final_loss: Option<f32>,
     pub exported_checkpoint: String,
-    pub evaluation: Evaluation,
+    #[serde(alias = "evaluation")]
+    pub eval: Eval,
 }
 
 pub fn train(
@@ -50,6 +53,9 @@ pub fn train(
     init: Option<DQN>,
 ) -> Result<TrainingResult> {
     run_cfg.validate()?;
+    if run_cfg.training.alg == Alg::Ppo {
+        return crate::ppo::train(run_cfg, dev, out, init);
+    }
     anyhow::ensure!(
         !out.exists() || std::fs::read_dir(out)?.next().is_none(),
         "Run directory is not empty: {}; choose another --out or seed",
@@ -67,11 +73,10 @@ pub fn train(
     let mut workers: Vec<Worker> = (0..cfg.envs)
         .map(|idx: usize| {
             let offset: u64 = u64::try_from(idx).expect("environment index fits u64");
-            let mut environment: Box<dyn env::Environment> =
-                env::create(&spec, cfg.seed.wrapping_add(offset))?;
-            let state: State = environment.reset()?;
+            let mut env: Box<dyn env::Env> = env::create(&spec, cfg.seed.wrapping_add(offset))?;
+            let state: State = env.reset()?;
             Ok(Worker {
-                env: environment,
+                env,
                 state,
                 ep_return: 0.0,
                 ep_steps: 0,
@@ -80,46 +85,43 @@ pub fn train(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut replay: ReplayMemory = ReplayMemory::new(cfg.replay_capacity, cfg.priority_alpha);
+    let mut replay: ReplayMemory = ReplayMemory::new(cfg.replay_cap, cfg.priority_alpha);
     let mut steps: u64 = 0;
     let mut episodes: u64 = 0;
     let mut update_tokens: u64 = 0;
-    let mut next_eval: u64 = cfg.evaluate_every;
+    let mut next_eval: u64 = cfg.eval_every;
     let mut last_eval: u64 = 0;
     let mut best: f32 = f32::NEG_INFINITY;
     let mut final_loss: Option<f32> = None;
-    let mut latest: Option<Evaluation> = None;
+    let mut latest: Option<Eval> = None;
     let mut returns: Vec<(u64, f32)> = Vec::new();
     let mut losses: Vec<(u64, f32)> = Vec::new();
 
-    let mut episode_log: BufWriter<File> =
-        BufWriter::new(File::create(out.join("episodes.csv"))?);
+    let mut episode_log: BufWriter<File> = BufWriter::new(File::create(out.join("episodes.csv"))?);
     writeln!(
         episode_log,
-        "decision,environment,episode,steps,raw_return,terminated,truncated,model_score,game_score"
+        "decision,env,episode,steps,raw_return,is_terminated,is_truncated,model_score,game_score"
     )?;
-    let mut train_log: BufWriter<File> =
-        BufWriter::new(File::create(out.join("training.csv"))?);
+    let mut train_log: BufWriter<File> = BufWriter::new(File::create(out.join("training.csv"))?);
     writeln!(
         train_log,
-        "decision,updates,loss,epsilon,replay,decisions_per_second"
+        "decision,updates,loss,eps,replay,decisions_per_sec"
     )?;
-    let mut eval_log: BufWriter<File> =
-        BufWriter::new(File::create(out.join("evaluations.jsonl"))?);
+    let mut eval_log: BufWriter<File> = BufWriter::new(File::create(out.join("evals.jsonl"))?);
 
     while steps < cfg.steps {
         let remaining: u64 = cfg.steps - steps;
         let batch_envs: u64 = remaining.min(u64::try_from(cfg.envs).expect("env count fits u64"));
         let n: usize = usize::try_from(batch_envs).expect("bounded env count fits usize");
-        let epsilon: f32 = if replay.len() < cfg.learning_starts {
+        let eps: f32 = if replay.len() < cfg.learning_starts {
             1.0
         } else {
-            cfg.epsilon(steps)
+            cfg.eps(steps)
         };
-        let random: Vec<bool> = (0..n)
-            .map(|_: usize| explore_rng.random::<f32>() < epsilon)
+        let is_rand: Vec<bool> = (0..n)
+            .map(|_: usize| explore_rng.random::<f32>() < eps)
             .collect();
-        let mut actions: Vec<usize> = if random.iter().any(|val: &bool| !*val) {
+        let mut actions: Vec<usize> = if is_rand.iter().any(|val: &bool| !*val) {
             let states: Vec<State> = workers[..n]
                 .iter()
                 .map(|worker: &Worker| worker.state.clone())
@@ -128,67 +130,66 @@ pub fn train(
         } else {
             vec![0; n]
         };
-        for (idx, &is_random) in random.iter().enumerate() {
-            if is_random {
+        for (idx, &is_rand) in is_rand.iter().enumerate() {
+            if is_rand {
                 actions[idx] = explore_rng.random_range(0..spec.actions.len());
             }
         }
 
-        let collected: Vec<Result<(Vec<Transition>, Option<Episode>)>> = workers[..n]
+        let collected: Vec<Result<(Vec<Tran>, Option<Episode>)>> = workers[..n]
             .par_iter_mut()
             .zip(actions.par_iter())
             .enumerate()
             .map(|(idx, (worker, &action))| {
                 let state: State = worker.state.clone();
                 let step: env::Step = worker.env.step(action)?;
-                let done: bool = step.done();
+                let is_done: bool = step.is_done();
                 worker.ep_return += step.reward;
                 worker.ep_steps += 1;
-                let reward: f32 = if cfg.clip_reward {
+                let reward: f32 = if cfg.is_clip_reward {
                     step.reward.clamp(-1.0, 1.0)
                 } else {
                     step.reward
                 };
-                let transitions: Vec<Transition> = worker.nstep.push(RawTransition {
+                let trans: Vec<Tran> = worker.nstep.push(RawTran {
                     state,
                     action,
                     reward,
                     next: step.state.clone(),
-                    terminated: step.terminated || step.life_lost,
-                    episode_end: done || step.life_lost,
+                    is_terminated: step.is_terminated || step.is_life_lost,
+                    is_episode_end: is_done || step.is_life_lost,
                 });
-                let episode: Option<Episode> = done.then_some(Episode {
+                let episode: Option<Episode> = is_done.then_some(Episode {
                     seed: cfg
                         .seed
                         .wrapping_add(u64::try_from(idx).expect("environment index fits u64")),
                     steps: worker.ep_steps,
                     raw_return: worker.ep_return,
-                    terminated: step.terminated,
-                    truncated: step.truncated,
-                    evaluation_cutoff: false,
+                    is_terminated: step.is_terminated,
+                    is_truncated: step.is_truncated,
+                    is_eval_cutoff: false,
                     scores: step.scores,
                 });
-                worker.state = if done {
+                worker.state = if is_done {
                     worker.ep_return = 0.0;
                     worker.ep_steps = 0;
                     worker.env.reset()?
                 } else {
                     step.state
                 };
-                Ok((transitions, episode))
+                Ok((trans, episode))
             })
             .collect();
 
         for (idx, result) in collected.into_iter().enumerate() {
-            let (transitions, episode): (Vec<Transition>, Option<Episode>) = result?;
-            for transition in transitions {
-                replay.push(transition);
+            let (trans, episode): (Vec<Tran>, Option<Episode>) = result?;
+            for tran in trans {
+                replay.push(tran);
             }
             if let Some(episode) = episode {
                 episodes += 1;
-                let decision: u64 = steps
-                    + u64::try_from(idx).expect("environment index fits u64")
-                    + 1;
+                let decision: u64 =
+                    steps + u64::try_from(idx).expect("environment index fits u64") + 1;
                 returns.push((decision, episode.raw_return));
                 let scores: [String; 2] = episode
                     .scores
@@ -199,8 +200,8 @@ pub fn train(
                     "{decision},{idx},{episodes},{},{},{},{},{},{}",
                     episode.steps,
                     episode.raw_return,
-                    episode.terminated,
-                    episode.truncated,
+                    episode.is_terminated,
+                    episode.is_truncated,
                     scores[0],
                     scores[1]
                 )?;
@@ -228,7 +229,7 @@ pub fn train(
                     let elapsed: f64 = start.elapsed().as_secs_f64().max(f64::EPSILON);
                     writeln!(
                         train_log,
-                        "{steps},{},{loss},{epsilon},{},{}",
+                        "{steps},{},{loss},{eps},{},{}",
                         agent.updates,
                         replay.len(),
                         steps as f64 / elapsed
@@ -238,19 +239,19 @@ pub fn train(
         }
 
         if steps >= next_eval || steps == cfg.steps {
-            let report: Evaluation = evaluate::evaluate(
+            let report: Eval = eval::eval(
                 &agent.model,
                 &spec,
                 cfg.seed.wrapping_add(1_000_000),
-                cfg.evaluation_episodes,
-                cfg.evaluation_max_steps,
+                cfg.eval_episodes,
+                cfg.eval_max_steps,
             )?;
             let meta: Metadata = Metadata {
                 training_step: steps,
                 ..Metadata::fresh(run_cfg.clone())
             };
             checkpoint::save(&out.join("last.safetensors"), &agent.model, &meta)?;
-            if report.completed == cfg.evaluation_episodes
+            if report.completed == cfg.eval_episodes
                 && let Some(mean) = report.mean_completed_return
                 && mean > best
             {
@@ -276,13 +277,13 @@ pub fn train(
                 steps,
                 agent.updates,
                 report.completed,
-                cfg.evaluation_episodes,
+                cfg.eval_episodes,
                 report.mean_completed_return
             );
             latest = Some(report);
             last_eval = steps;
             while next_eval <= steps {
-                next_eval = next_eval.saturating_add(cfg.evaluate_every);
+                next_eval = next_eval.saturating_add(cfg.eval_every);
             }
         }
     }
@@ -305,16 +306,13 @@ pub fn train(
         decisions: steps,
         updates: agent.updates,
         episodes,
-        wall_seconds: secs,
-        decisions_per_second: steps as f64 / secs,
+        wall_secs: secs,
+        decisions_per_sec: steps as f64 / secs,
         final_loss,
         exported_checkpoint: exported_checkpoint.to_owned(),
-        evaluation: latest.expect("final evaluation is mandatory"),
+        eval: latest.expect("final evaluation is mandatory"),
     };
-    std::fs::write(
-        out.join("result.json"),
-        serde_json::to_vec_pretty(&result)?,
-    )?;
+    std::fs::write(out.join("result.json"), serde_json::to_vec_pretty(&result)?)?;
     Ok(result)
 }
 
@@ -323,7 +321,12 @@ fn chart(returns: &[(u64, f32)], losses: &[(u64, f32)]) -> String {
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="960" height="500" viewBox="0 0 960 500"><rect width="960" height="500" fill="white"/><g font-family="sans-serif" font-size="14" fill="#222">"##,
     );
     for (data, top, title, color) in [
-        (returns, 40.0_f64, "Training episode return (raw)", "#2563eb"),
+        (
+            returns,
+            40.0_f64,
+            "Training episode return (raw)",
+            "#2563eb",
+        ),
         (
             losses,
             280.0_f64,

@@ -1,4 +1,4 @@
-use super::{Environment, Step};
+use super::{Env, Step};
 use crate::{
     config::{GameSpec, Scoring},
     preprocess::{FrameHistory, Preprocessor},
@@ -8,7 +8,7 @@ use ale_bridge::{Ale, Info};
 use anyhow::{Result, anyhow, ensure};
 use std::sync::Arc;
 
-pub struct AtariEnvironment {
+pub struct AtariEnv {
     spec: GameSpec,
     ale: Ale,
     prep: Preprocessor,
@@ -19,14 +19,14 @@ pub struct AtariEnvironment {
     scores: [f32; 2],
 }
 
-impl AtariEnvironment {
+impl AtariEnv {
     pub fn new(spec: GameSpec, seed: u64) -> Result<Self> {
-        let ale_seed: u32 = u32::try_from(seed & u64::from(u32::MAX))
-            .expect("masked seed always fits u32");
-        let ale: Ale = Ale::new(&spec.rom, ale_seed, spec.sticky_probability)
-            .map_err(|err: String| anyhow!(err))?;
+        let ale_seed: u32 =
+            u32::try_from(seed & u64::from(u32::MAX)).expect("masked seed always fits u32");
+        let ale: Ale =
+            Ale::new(&spec.rom, ale_seed, spec.sticky_prob).map_err(|err: String| anyhow!(err))?;
         ensure!(
-            ale.actions() == spec.minimal_actions,
+            ale.actions() == spec.min_actions,
             "{} minimal action set differs from config: {:?}",
             spec.key,
             ale.actions()
@@ -44,7 +44,7 @@ impl AtariEnvironment {
         })
     }
 
-    fn random(&mut self, n: u32) -> u32 {
+    fn rand(&mut self, n: u32) -> u32 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
         self.rng ^= self.rng << 5;
@@ -53,16 +53,14 @@ impl AtariEnvironment {
 
     fn obs(&mut self) -> State {
         let [w, h]: [usize; 2] = self.ale.dimensions();
-        let frame: Arc<[u8]> = self
-            .prep
-            .process(self.ale.rgb(), w, h, self.spec.grayscale);
+        let frame: Arc<[u8]> = self.prep.process(self.ale.rgb(), w, h, self.spec.grayscale);
         self.hist.push(frame)
     }
 
     fn repeat(&mut self, action: usize) -> Result<Info> {
-        let _: u32 = self.random(1);
+        let _: u32 = self.rand(1);
         self.ale
-            .step(action, self.spec.frame_skip, self.spec.max_pool)
+            .step(action, self.spec.frame_skip, self.spec.is_max_pool)
             .map_err(|err: String| anyhow!(err))
     }
 
@@ -73,19 +71,19 @@ impl AtariEnvironment {
                 self.scores[1] += (-reward).max(0.0);
             }
             Scoring::Ram {
-                addresses,
-                bcd,
+                addrs,
+                is_bcd,
                 overrides,
             } => {
                 let ram: &[u8; 128] = self.ale.ram();
-                self.scores = addresses.map(|addr: usize| {
+                self.scores = addrs.map(|addr: usize| {
                     let val: u8 = ram[addr];
                     if let Some(pair) = overrides
                         .iter()
                         .find(|pair: &&[u16; 2]| pair[0] == u16::from(val))
                     {
                         f32::from(pair[1])
-                    } else if *bcd {
+                    } else if *is_bcd {
                         f32::from((val >> 4) * 10 + (val & 15))
                     } else {
                         f32::from(val)
@@ -96,7 +94,7 @@ impl AtariEnvironment {
     }
 }
 
-impl Environment for AtariEnvironment {
+impl Env for AtariEnv {
     fn reset(&mut self) -> Result<State> {
         let mut last: Info = self.ale.reset().map_err(|err: String| anyhow!(err))?;
         self.hist.reset();
@@ -106,7 +104,7 @@ impl Environment for AtariEnvironment {
         let noops: u32 = if self.spec.noop_max == 0 {
             0
         } else {
-            self.random(self.spec.noop_max) + 1
+            self.rand(self.spec.noop_max) + 1
         };
         for _ in 0..noops {
             let info: Info = self
@@ -114,7 +112,7 @@ impl Environment for AtariEnvironment {
                 .step(0, self.spec.noop_frame_skip, false)
                 .map_err(|err: String| anyhow!(err))?;
             last = info;
-            if info.done != 0 {
+            if info.is_done != 0 {
                 last = self.ale.reset().map_err(|err: String| anyhow!(err))?;
             }
         }
@@ -122,7 +120,7 @@ impl Environment for AtariEnvironment {
         for action in self.spec.reset_actions.clone() {
             let info: Info = self.repeat(action)?;
             last = info;
-            if info.done != 0 {
+            if info.is_done != 0 {
                 last = self.ale.reset().map_err(|err: String| anyhow!(err))?;
             }
         }
@@ -138,14 +136,14 @@ impl Environment for AtariEnvironment {
         let reward: f32 = info.reward;
         self.update_scores(reward);
 
-        let life_lost: bool = self.spec.episodic_life
-            && info.done == 0
+        let is_life_lost: bool = self.spec.is_episodic_life
+            && info.is_done == 0
             && info.lives > 0
             && info.lives < self.lives;
-        if life_lost {
+        if is_life_lost {
             for reset_action in std::iter::once(0).chain(self.spec.reset_actions.clone()) {
                 info = self.repeat(reset_action)?;
-                if info.done != 0 {
+                if info.is_done != 0 {
                     break;
                 }
             }
@@ -157,9 +155,9 @@ impl Environment for AtariEnvironment {
         Ok(Step {
             state: self.obs(),
             reward,
-            terminated: info.done != 0 && info.truncated == 0,
-            truncated: info.truncated != 0 || self.steps >= self.spec.max_episode_steps,
-            life_lost,
+            is_terminated: info.is_done != 0 && info.is_truncated == 0,
+            is_truncated: info.is_truncated != 0 || self.steps >= self.spec.max_episode_steps,
+            is_life_lost,
             scores: Some(self.scores),
         })
     }

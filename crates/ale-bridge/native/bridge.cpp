@@ -10,8 +10,8 @@
 
 struct Handle {
     ale::ALEInterface ale;
-    std::vector<unsigned char> current;
-    std::vector<unsigned char> previous;
+    std::vector<unsigned char> cur;
+    std::vector<unsigned char> prev;
     std::vector<ale::Action> actions;
 };
 
@@ -24,9 +24,9 @@ struct Info {
     int32_t height;
 };
 
-static void fail(char* out, size_t size, const char* message) {
+static void fail(char* out, size_t size, const char* msg) {
     if (size) {
-        std::strncpy(out, message, size - 1);
+        std::strncpy(out, msg, size - 1);
         out[size - 1] = 0;
     }
 }
@@ -34,27 +34,27 @@ static void fail(char* out, size_t size, const char* message) {
 static void capture(
     Handle& h,
     uint8_t* rgb,
-    size_t capacity,
+    size_t cap,
     uint8_t* ram,
     Info* info,
-    bool pool
+    bool is_pool
 ) {
     info->width = h.ale.getScreen().width();
     info->height = h.ale.getScreen().height();
 
     if (
-        h.current.size() != size_t(info->width) * size_t(info->height) * 3 ||
-        capacity < h.current.size()
+        h.cur.size() != size_t(info->width) * size_t(info->height) * 3 ||
+        cap < h.cur.size()
     ) {
         throw std::runtime_error("Invalid RGB buffer dimensions");
     }
 
-    if (pool && h.previous.size() == h.current.size()) {
-        for (size_t i = 0; i < h.current.size(); ++i) {
-            rgb[i] = std::max(h.current[i], h.previous[i]);
+    if (is_pool && h.prev.size() == h.cur.size()) {
+        for (size_t i = 0; i < h.cur.size(); ++i) {
+            rgb[i] = std::max(h.cur[i], h.prev[i]);
         }
     } else {
-        std::memcpy(rgb, h.current.data(), h.current.size());
+        std::memcpy(rgb, h.cur.data(), h.cur.size());
     }
 
     const auto& memory = h.ale.getRAM();
@@ -82,7 +82,7 @@ void* rl_ale_create(
     int32_t* count,
     int32_t* width,
     int32_t* height,
-    char* error,
+    char* err,
     size_t size
 ) {
     try {
@@ -112,7 +112,7 @@ void* rl_ale_create(
 
         return h.release();
     } catch (const std::exception& e) {
-        fail(error, size, e.what());
+        fail(err, size, e.what());
         return nullptr;
     }
 }
@@ -124,24 +124,24 @@ void rl_ale_destroy(void* handle) {
 int32_t rl_ale_reset(
     void* handle,
     uint8_t* rgb,
-    size_t capacity,
+    size_t cap,
     uint8_t* ram,
     Info* info,
-    char* error,
+    char* err,
     size_t size
 ) {
     try {
         auto& h = *static_cast<Handle*>(handle);
 
         h.ale.reset_game();
-        h.ale.getScreenRGB(h.current);
-        h.previous.clear();
+        h.ale.getScreenRGB(h.cur);
+        h.prev.clear();
         info->reward = 0;
 
-        capture(h, rgb, capacity, ram, info, false);
+        capture(h, rgb, cap, ram, info, false);
         return 0;
     } catch (const std::exception& e) {
-        fail(error, size, e.what());
+        fail(err, size, e.what());
         return -1;
     }
 }
@@ -150,12 +150,12 @@ int32_t rl_ale_step(
     void* handle,
     int32_t action,
     uint32_t repeat,
-    int32_t pool,
+    int32_t is_pool,
     uint8_t* rgb,
-    size_t capacity,
+    size_t cap,
     uint8_t* ram,
     Info* info,
-    char* error,
+    char* err,
     size_t size
 ) {
     try {
@@ -171,23 +171,23 @@ int32_t rl_ale_step(
         }
 
         info->reward = 0;
-        h.previous.clear();
+        h.prev.clear();
 
         for (uint32_t i = 0; i < repeat; ++i) {
             info->reward += float(h.ale.act(h.actions[action]));
 
-            h.previous.swap(h.current);
-            h.ale.getScreenRGB(h.current);
+            h.prev.swap(h.cur);
+            h.ale.getScreenRGB(h.cur);
 
             if (h.ale.game_over()) {
                 break;
             }
         }
 
-        capture(h, rgb, capacity, ram, info, pool != 0);
+        capture(h, rgb, cap, ram, info, is_pool != 0);
         return 0;
     } catch (const std::exception& e) {
-        fail(error, size, e.what());
+        fail(err, size, e.what());
         return -1;
     }
 }

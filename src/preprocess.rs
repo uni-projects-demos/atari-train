@@ -21,7 +21,11 @@ struct Plan {
 impl Preprocessor {
     pub fn process(&mut self, rgb: &[u8], w: usize, h: usize, order: Grayscale) -> Arc<[u8]> {
         let shape: [usize; 4] = [w, h, FRAME_WIDTH, FRAME_HEIGHT];
-        if self.plan.as_ref().is_none_or(|plan: &Plan| plan.shape != shape) {
+        if self
+            .plan
+            .as_ref()
+            .is_none_or(|plan: &Plan| plan.shape != shape)
+        {
             self.plan = Some(Plan {
                 shape,
                 horiz: weights(w, FRAME_WIDTH),
@@ -62,10 +66,8 @@ fn luma(px: &[u8], order: Grayscale) -> u8 {
         Grayscale::BeforeResize => (4899, 9617, 1868, 14),
         Grayscale::AfterResize => (9798, 19235, 3735, 15),
     };
-    let rounded: u32 = u32::from(px[0]) * r
-        + u32::from(px[1]) * g
-        + u32::from(px[2]) * b
-        + (1_u32 << (shift - 1));
+    let rounded: u32 =
+        u32::from(px[0]) * r + u32::from(px[1]) * g + u32::from(px[2]) * b + (1_u32 << (shift - 1));
     u8::try_from(rounded >> shift).expect("luma is bounded by u8")
 }
 
@@ -152,6 +154,12 @@ impl FrameHistory {
             let _ = self.frames.pop_front();
         }
         self.frames.push_back(frame);
-        State::new(self.frames.iter().cloned().collect::<Vec<Arc<[u8]>>>().into())
+        State::new(
+            self.frames
+                .iter()
+                .cloned()
+                .collect::<Vec<Arc<[u8]>>>()
+                .into(),
+        )
     }
 }

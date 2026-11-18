@@ -29,8 +29,10 @@ pub enum Grayscale {
 pub enum Scoring {
     Signed,
     Ram {
-        addresses: [usize; 2],
-        bcd: bool,
+        #[serde(alias = "addresses")]
+        addrs: [usize; 2],
+        #[serde(alias = "bcd")]
+        is_bcd: bool,
         overrides: Vec<[u16; 2]>,
     },
 }
@@ -42,16 +44,20 @@ pub struct GameSpec {
     pub rom: PathBuf,
     pub scoring: Scoring,
     pub actions: Vec<usize>,
-    pub minimal_actions: Vec<i32>,
+    #[serde(alias = "minimal_actions")]
+    pub min_actions: Vec<i32>,
     pub grayscale: Grayscale,
     pub padding: Padding,
     pub frame_skip: u32,
-    pub sticky_probability: f32,
-    pub max_pool: bool,
+    #[serde(alias = "sticky_probability")]
+    pub sticky_prob: f32,
+    #[serde(alias = "max_pool")]
+    pub is_max_pool: bool,
     pub noop_max: u32,
     pub noop_frame_skip: u32,
     pub reset_actions: Vec<usize>,
-    pub episodic_life: bool,
+    #[serde(alias = "episodic_life")]
+    pub is_episodic_life: bool,
     pub max_episode_steps: u64,
     pub hidden: usize,
 }
@@ -61,10 +67,10 @@ impl GameSpec {
         [FRAME_STACK, FRAME_HEIGHT, FRAME_WIDTH]
     }
 
-    pub fn arena_compatible(&self) -> bool {
+    pub fn is_arena_compatible(&self) -> bool {
         GAMES.contains(&self.key.as_str())
             && Self::named(&self.key).is_ok_and(|target: Self| {
-                self.minimal_actions == target.minimal_actions
+                self.min_actions == target.min_actions
                     && self.grayscale == target.grayscale
                     && (self.padding == target.padding
                         || self.padding == Padding::Repeat && target.padding == Padding::Zero)
@@ -80,21 +86,18 @@ impl GameSpec {
                     .all(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
             "Invalid game key"
         );
-        ensure!(
-            !self.rom.as_os_str().is_empty(),
-            "Missing Atari ROM path"
-        );
-        if let Scoring::Ram { addresses, .. } = &self.scoring {
+        ensure!(!self.rom.as_os_str().is_empty(), "Missing Atari ROM path");
+        if let Scoring::Ram { addrs, .. } = &self.scoring {
             ensure!(
-                addresses.iter().all(|&addr: &usize| addr < 128),
+                addrs.iter().all(|&addr: &usize| addr < 128),
                 "RAM score addresses must be 0..127"
             );
         }
         ensure!(
-            !self.minimal_actions.is_empty()
-                && self.minimal_actions.len() <= ALE_ACTIONS
+            !self.min_actions.is_empty()
+                && self.min_actions.len() <= ALE_ACTIONS
                 && self
-                    .minimal_actions
+                    .min_actions
                     .iter()
                     .all(|&action: &i32| (0..ALE_ACTIONS as i32).contains(&action)),
             "Invalid raw ALE action set"
@@ -106,13 +109,14 @@ impl GameSpec {
         ensure!(
             self.actions
                 .iter()
-                .all(|&action: &usize| action < self.minimal_actions.len()),
+                .all(|&action: &usize| action < self.min_actions.len()),
             "Action map leaves minimal action set"
         );
         ensure!(
-            self.actions.iter().enumerate().all(|(idx, action): (usize, &usize)| {
-                !self.actions[..idx].contains(action)
-            }),
+            self.actions
+                .iter()
+                .enumerate()
+                .all(|(idx, action): (usize, &usize)| { !self.actions[..idx].contains(action) }),
             "Duplicate policy actions"
         );
         ensure!(
@@ -120,15 +124,15 @@ impl GameSpec {
             "Frame repeat must be 1..60"
         );
         ensure!(
-            self.sticky_probability.is_finite()
-                && (0.0..=1.0).contains(&self.sticky_probability)
+            self.sticky_prob.is_finite()
+                && (0.0..=1.0).contains(&self.sticky_prob)
                 && self.noop_max <= 100,
             "Invalid reset/sticky settings"
         );
         ensure!(
             self.reset_actions
                 .iter()
-                .all(|&action: &usize| action < self.minimal_actions.len()),
+                .all(|&action: &usize| action < self.min_actions.len()),
             "Invalid reset action"
         );
         ensure!(
@@ -139,9 +143,7 @@ impl GameSpec {
     }
 
     pub fn named(name: &str) -> Result<Self> {
-        let normalized: String = name
-            .to_ascii_lowercase()
-            .replace(['-', '/', '_', ' '], "");
+        let normalized: String = name.to_ascii_lowercase().replace(['-', '/', '_', ' '], "");
         let key: &'static str = match normalized.as_str() {
             "pong" | "alepongv5" | "pongv0" | "pongv4" => "pong",
             "breakout" | "alebreakoutv5" => "breakout",
@@ -152,13 +154,13 @@ impl GameSpec {
             _ => bail!("Unknown Atari game {name}; use a full --config file for a custom ROM"),
         };
 
-        let minimal_actions: Vec<i32> = match key {
+        let min_actions: Vec<i32> = match key {
             "pong" | "spaceinvaders" => vec![0, 1, 3, 4, 11, 12],
             "breakout" => vec![0, 1, 3, 4],
             _ => (0..ALE_ACTIONS as i32).collect(),
         };
-        let actions: Vec<usize> = (0..minimal_actions.len()).collect();
-        let sample_factory_compatible: bool = ["boxing", "icehockey", "tennis"].contains(&key);
+        let actions: Vec<usize> = (0..min_actions.len()).collect();
+        let is_sample_factory_compatible: bool = ["boxing", "icehockey", "tennis"].contains(&key);
         let rom_name: &'static str = match key {
             "icehockey" => "ice_hockey",
             "spaceinvaders" => "space_invaders",
@@ -166,18 +168,18 @@ impl GameSpec {
         };
         let scoring: Scoring = match key {
             "boxing" => Scoring::Ram {
-                addresses: [18, 19],
-                bcd: true,
+                addrs: [18, 19],
+                is_bcd: true,
                 overrides: vec![[192, 100]],
             },
             "icehockey" => Scoring::Ram {
-                addresses: [10, 11],
-                bcd: true,
+                addrs: [10, 11],
+                is_bcd: true,
                 overrides: Vec::new(),
             },
             "tennis" => Scoring::Ram {
-                addresses: [71, 72],
-                bcd: false,
+                addrs: [71, 72],
+                is_bcd: false,
                 overrides: Vec::new(),
             },
             _ => Scoring::Signed,
@@ -192,82 +194,122 @@ impl GameSpec {
             rom: PathBuf::from(format!("assets/roms/{rom_name}.bin")),
             scoring,
             actions,
-            minimal_actions,
-            grayscale: if sample_factory_compatible {
+            min_actions,
+            grayscale: if is_sample_factory_compatible {
                 Grayscale::AfterResize
             } else {
                 Grayscale::BeforeResize
             },
-            padding: if sample_factory_compatible {
+            padding: if is_sample_factory_compatible {
                 Padding::Repeat
             } else {
                 Padding::Zero
             },
             frame_skip: 4,
-            sticky_probability: 0.0,
-            max_pool: true,
+            sticky_prob: 0.0,
+            is_max_pool: true,
             noop_max: 30,
             noop_frame_skip: 1,
             reset_actions,
-            episodic_life: key == "breakout",
+            is_episodic_life: key == "breakout",
             max_episode_steps: MAX_EPISODE_STEPS,
             hidden: 512,
         })
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Alg {
+    #[default]
+    Dqn,
+    Rainbow,
+    Iqn,
+    Ppo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TrainingConfig {
+    #[serde(alias = "algorithm")]
+    pub alg: Alg,
+    pub iqn_quantiles: usize,
+    pub ppo_rollout: usize,
+    pub ppo_epochs: usize,
+    pub ppo_minibatch: usize,
+    pub ppo_clip: f32,
+    pub ppo_gae_lambda: f32,
+    #[serde(alias = "ppo_value_coef")]
+    pub ppo_val_coef: f32,
+    pub ppo_entropy_coef: f32,
     pub seed: u64,
     pub steps: u64,
     pub envs: usize,
-    pub replay_capacity: usize,
+    #[serde(alias = "replay_capacity")]
+    pub replay_cap: usize,
     pub batch_size: usize,
     pub learning_starts: usize,
     pub train_every: u64,
     pub gradient_steps: usize,
     pub target_every: u64,
-    pub learning_rate: f64,
+    #[serde(alias = "learning_rate")]
+    pub lr: f64,
     pub gamma: f32,
     pub n_step: usize,
-    pub epsilon_start: f32,
-    pub epsilon_end: f32,
-    pub epsilon_decay: u64,
+    #[serde(alias = "epsilon_start")]
+    pub eps_start: f32,
+    #[serde(alias = "epsilon_end")]
+    pub eps_end: f32,
+    #[serde(alias = "epsilon_decay")]
+    pub eps_decay: u64,
     pub priority_alpha: f32,
     pub priority_beta: f32,
-    pub clip_reward: bool,
-    pub dueling: bool,
-    pub evaluate_every: u64,
-    pub evaluation_episodes: usize,
-    pub evaluation_max_steps: u64,
+    #[serde(alias = "clip_reward")]
+    pub is_clip_reward: bool,
+    #[serde(alias = "dueling")]
+    pub is_dueling: bool,
+    #[serde(alias = "evaluate_every")]
+    pub eval_every: u64,
+    #[serde(alias = "evaluation_episodes")]
+    pub eval_episodes: usize,
+    #[serde(alias = "evaluation_max_steps")]
+    pub eval_max_steps: u64,
 }
 
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
+            alg: Alg::Dqn,
+            iqn_quantiles: 16,
+            ppo_rollout: 128,
+            ppo_epochs: 4,
+            ppo_minibatch: 128,
+            ppo_clip: 0.1,
+            ppo_gae_lambda: 0.95,
+            ppo_val_coef: 0.5,
+            ppo_entropy_coef: 0.01,
             seed: 42,
             steps: 50_000_000,
             envs: 4,
-            replay_capacity: 100_000,
+            replay_cap: 100_000,
             batch_size: 32,
             learning_starts: 20_000,
             train_every: 4,
             gradient_steps: 1,
             target_every: 2_000,
-            learning_rate: 6.25e-5,
+            lr: 6.25e-5,
             gamma: 0.99,
             n_step: 3,
-            epsilon_start: 1.0,
-            epsilon_end: 0.01,
-            epsilon_decay: 250_000,
+            eps_start: 1.0,
+            eps_end: 0.01,
+            eps_decay: 250_000,
             priority_alpha: 0.5,
             priority_beta: 0.4,
-            clip_reward: true,
-            dueling: true,
-            evaluate_every: 250_000,
-            evaluation_episodes: 5,
-            evaluation_max_steps: MAX_EPISODE_STEPS,
+            is_clip_reward: true,
+            is_dueling: true,
+            eval_every: 250_000,
+            eval_episodes: 5,
+            eval_max_steps: MAX_EPISODE_STEPS,
         }
     }
 }
@@ -275,41 +317,53 @@ impl Default for TrainingConfig {
 impl TrainingConfig {
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            (1..=64).contains(&self.iqn_quantiles)
+                && (1..=4096).contains(&self.ppo_rollout)
+                && (1..=32).contains(&self.ppo_epochs)
+                && (1..=8192).contains(&self.ppo_minibatch)
+                && (0.0..=1.0).contains(&self.ppo_clip)
+                && (0.0..=1.0).contains(&self.ppo_gae_lambda)
+                && self.ppo_val_coef.is_finite()
+                && self.ppo_val_coef >= 0.0
+                && self.ppo_entropy_coef.is_finite()
+                && self.ppo_entropy_coef >= 0.0,
+            "Invalid IQN/PPO hyperparameters"
+        );
+        ensure!(
             self.steps > 0 && (1..=256).contains(&self.envs),
             "Invalid steps/env count"
         );
         ensure!(
             self.batch_size > 0
-                && self.replay_capacity >= self.batch_size
-                && self.replay_capacity <= 10_000_000,
+                && self.replay_cap >= self.batch_size
+                && self.replay_cap <= 10_000_000,
             "Invalid replay/batch size"
         );
         ensure!(
-            self.learning_starts >= self.batch_size
-                && self.learning_starts <= self.replay_capacity,
+            self.learning_starts >= self.batch_size && self.learning_starts <= self.replay_cap,
             "learning_starts must be between batch size and replay capacity"
         );
         ensure!(
             self.train_every > 0
                 && self.target_every > 0
                 && (1..=64).contains(&self.gradient_steps)
-                && self.epsilon_decay > 0,
+                && self.eps_decay > 0,
             "Invalid update/epsilon periods"
         );
         ensure!(
-            self.learning_rate.is_finite()
-                && self.learning_rate > 0.0
+            self.lr.is_finite()
+                && self.lr > 0.0
                 && self.gamma.is_finite()
                 && (0.0..=1.0).contains(&self.gamma),
             "Invalid learning rate/gamma"
         );
         ensure!(
             (1..=32).contains(&self.n_step)
-                && self.epsilon_start.is_finite()
-                && self.epsilon_end.is_finite()
-                && (0.0..=1.0).contains(&self.epsilon_end)
-                && self.epsilon_start >= self.epsilon_end
-                && self.epsilon_start <= 1.0,
+                && self.eps_start.is_finite()
+                && self.eps_end.is_finite()
+                && (0.0..=1.0).contains(&self.eps_end)
+                && self.eps_start >= self.eps_end
+                && self.eps_start <= 1.0,
             "Invalid n-step/epsilon"
         );
         ensure!(
@@ -320,21 +374,21 @@ impl TrainingConfig {
             "Invalid replay priorities"
         );
         ensure!(
-            self.evaluate_every > 0
-                && (1..=256).contains(&self.evaluation_episodes)
-                && self.evaluation_max_steps > 0,
+            self.eval_every > 0
+                && (1..=256).contains(&self.eval_episodes)
+                && self.eval_max_steps > 0,
             "Invalid evaluation settings"
         );
         Ok(())
     }
 
-    pub fn epsilon(&self, step: u64) -> f32 {
+    pub fn eps(&self, step: u64) -> f32 {
         let warmup: u64 = u64::try_from(self.learning_starts)
             .expect("learning_starts fits u64 on supported targets");
-        let decay_step: u64 = step.saturating_sub(warmup).min(self.epsilon_decay);
-        let progress: f64 = decay_step as f64 / self.epsilon_decay as f64;
-        let start: f64 = f64::from(self.epsilon_start);
-        let end: f64 = f64::from(self.epsilon_end);
+        let decay_step: u64 = step.saturating_sub(warmup).min(self.eps_decay);
+        let progress: f64 = decay_step as f64 / self.eps_decay as f64;
+        let start: f64 = f64::from(self.eps_start);
+        let end: f64 = f64::from(self.eps_end);
         (end + (start - end) * (1.0 - progress)) as f32
     }
 }

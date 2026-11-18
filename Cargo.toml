@@ -1,10 +1,10 @@
 [package]
-name = "atari-train-dqn"
+name = "atari-train"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.99"
-description = "Deep-RL training and evaluation using ALE environments and DQN-based agents for Atari games."
-license = "GPL-3.0-only"
+rust-version = "1.100"
+description = "Deep-RL train, eval and export Atari policies for multiple games using ALE and Burn with DQN, IQN, PPO or Rainbow."
+license = "GPL-2.0-only"
 
 [workspace]
 members = ["crates/ale-bridge"]
@@ -18,11 +18,7 @@ gpu = ["burn/cuda", "burn/fusion", "burn/autotune"]
 [dependencies]
 anyhow = "1.0.104"
 ale-bridge = { path = "crates/ale-bridge", optional = true }
-burn = {
-    version = "=0.22.1",
-    default-features = false,
-    features = ["std", "optim", "flex", "simd", "rayon"]
-}
+burn = { version = "=0.22.1", default-features = false, features = ["std", "optim", "flex", "simd", "rayon"] }
 clap = { version = "4.6.7", features = ["derive"] }
 rand = "0.10.3"
 rand_chacha = "0.10.0"

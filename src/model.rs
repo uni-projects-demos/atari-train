@@ -1,4 +1,7 @@
-use crate::{config::GameSpec, state::State};
+use crate::{
+    config::{Alg, GameSpec},
+    state::State,
+};
 use anyhow::{Result, ensure};
 use burn::{
     module::Param,
@@ -7,12 +10,17 @@ use burn::{
         conv::{Conv2d, Conv2dConfig},
     },
     prelude::*,
-    tensor::activation::relu,
+    tensor::activation::{relu, softmax},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const PIXEL_SCALE: f32 = 255.0;
+pub const RAINBOW_ATOMS: usize = 51;
+pub const RAINBOW_MIN: f32 = -10.0;
+pub const RAINBOW_MAX: f32 = 10.0;
+pub const IQN_FEATURES: usize = 64;
+pub const IQN_EVAL_QUANTILES: usize = 32;
 pub const CONVS: [(usize, usize, usize, usize); 3] =
     [(4, 32, 8, 4), (32, 64, 4, 2), (64, 64, 3, 1)];
 
@@ -22,51 +30,180 @@ pub struct DQN {
     hidden: Linear,
     output: Linear,
     val: Option<Linear>,
+    quantile: Option<Linear>,
+    #[module(skip)]
+    pub algo: Alg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Weight {
     pub shape: Vec<usize>,
-    pub values: Vec<f32>,
+    pub vals: Vec<f32>,
 }
 
 pub type Weights = BTreeMap<String, Weight>;
 
 impl DQN {
-    pub fn new(spec: &GameSpec, dueling: bool, dev: &Device) -> Self {
+    pub fn new(spec: &GameSpec, is_dueling: bool, dev: &Device) -> Self {
+        Self::new_algo(spec, Alg::Dqn, is_dueling, dev)
+    }
+
+    pub fn new_algo(spec: &GameSpec, algo: Alg, is_dueling: bool, dev: &Device) -> Self {
         let convs: Vec<Conv2d> = CONVS
             .iter()
-            .map(|&(inp, out, kernel, stride): &(usize, usize, usize, usize)| {
-                Conv2dConfig::new([inp, out], [kernel, kernel])
-                    .with_stride([stride, stride])
-                    .init(dev)
-            })
+            .map(
+                |&(inp, out, kernel, stride): &(usize, usize, usize, usize)| {
+                    Conv2dConfig::new([inp, out], [kernel, kernel])
+                        .with_stride([stride, stride])
+                        .init(dev)
+                },
+            )
             .collect();
         let hidden: Linear = LinearConfig::new(3136, spec.hidden).init(dev);
-        let output: Linear = LinearConfig::new(spec.hidden, spec.actions.len()).init(dev);
-        let val: Option<Linear> = dueling.then(|| LinearConfig::new(spec.hidden, 1).init(dev));
+        let output_features = spec.actions.len()
+            * if algo == Alg::Rainbow {
+                RAINBOW_ATOMS
+            } else {
+                1
+            };
+        let output: Linear = LinearConfig::new(spec.hidden, output_features).init(dev);
+        let val_features = if algo == Alg::Rainbow {
+            RAINBOW_ATOMS
+        } else {
+            1
+        };
+        let val: Option<Linear> = (is_dueling || algo == Alg::Ppo)
+            .then(|| LinearConfig::new(spec.hidden, val_features).init(dev));
+        let quantile: Option<Linear> =
+            (algo == Alg::Iqn).then(|| LinearConfig::new(IQN_FEATURES, spec.hidden).init(dev));
 
         Self {
             convs,
             hidden,
             output,
             val,
+            quantile,
+            algo,
         }
     }
 
-    pub fn forward(&self, inp: Tensor<4>) -> Tensor<2> {
+    fn features(&self, inp: Tensor<4>) -> Tensor<2> {
         let mut x: Tensor<4> = inp / PIXEL_SCALE;
         for conv in &self.convs {
             x = relu(conv.forward(x));
         }
-        let feat: Tensor<2> = relu(self.hidden.forward(x.flatten::<2>(1, 3)));
+        relu(self.hidden.forward(x.flatten::<2>(1, 3)))
+    }
+
+    fn head(&self, feat: Tensor<2>) -> Tensor<2> {
         let adv: Tensor<2> = self.output.forward(feat.clone());
+        if self.algo == Alg::Ppo {
+            return adv;
+        }
         match &self.val {
             Some(val) => {
-                let mean: Tensor<2> = adv.clone().mean_dim(1);
-                val.forward(feat) + adv - mean
+                let mean: Tensor<2> = if self.algo == Alg::Rainbow {
+                    let [n, _] = adv.dims();
+                    adv.clone()
+                        .reshape([n, self.n_actions(), RAINBOW_ATOMS])
+                        .mean_dim(1)
+                        .reshape([n, RAINBOW_ATOMS])
+                } else {
+                    adv.clone().mean_dim(1)
+                };
+                if self.algo == Alg::Rainbow {
+                    let [n, _] = adv.dims();
+                    ((val.forward(feat) - mean).reshape([n, 1, RAINBOW_ATOMS])
+                        + adv.reshape([n, self.n_actions(), RAINBOW_ATOMS]))
+                    .reshape([n, self.n_actions() * RAINBOW_ATOMS])
+                } else {
+                    val.forward(feat) + adv - mean
+                }
             }
             None => adv,
+        }
+    }
+
+    fn n_actions(&self) -> usize {
+        let size = self.output.bias.as_ref().expect("linear bias").val().dims()[0];
+        if self.algo == Alg::Rainbow {
+            size / RAINBOW_ATOMS
+        } else {
+            size
+        }
+    }
+
+    pub fn rainbow_logits(&self, inp: Tensor<4>) -> Tensor<3> {
+        assert_eq!(self.algo, Alg::Rainbow);
+        let n = inp.dims()[0];
+        self.head(self.features(inp))
+            .reshape([n, self.n_actions(), RAINBOW_ATOMS])
+    }
+
+    pub fn forward_iqn(&self, inp: Tensor<4>, taus: &[f32], n_quantiles: usize) -> Tensor<3> {
+        assert_eq!(self.algo, Alg::Iqn);
+        let n = inp.dims()[0];
+        assert_eq!(taus.len(), n * n_quantiles);
+        let dev: Device = inp.device();
+        let mut cosines = Vec::with_capacity(taus.len() * IQN_FEATURES);
+        for &tau in taus {
+            for k in 1..=IQN_FEATURES {
+                cosines.push((std::f32::consts::PI * k as f32 * tau).cos());
+            }
+        }
+        let emb: Tensor<2> = Tensor::from_data(
+            TensorData::new(cosines, [n * n_quantiles, IQN_FEATURES]),
+            &dev,
+        );
+        let emb: Tensor<3> = relu(self.quantile.as_ref().expect("IQN projection").forward(emb))
+            .reshape([n, n_quantiles, self.hidden.weight.val().dims()[1]]);
+        let feat: Tensor<2> = self.features(inp);
+        let hidden = self.hidden.weight.val().dims()[1];
+        let fused: Tensor<2> =
+            (feat.reshape([n, 1, hidden]) * emb).reshape([n * n_quantiles, hidden]);
+        self.head(fused).reshape([n, n_quantiles, self.n_actions()])
+    }
+
+    pub fn val(&self, inp: Tensor<4>) -> Tensor<1> {
+        assert_eq!(self.algo, Alg::Ppo);
+        let n = inp.dims()[0];
+        self.val
+            .as_ref()
+            .expect("PPO critic")
+            .forward(self.features(inp))
+            .reshape([n])
+    }
+
+    pub fn forward(&self, inp: Tensor<4>) -> Tensor<2> {
+        match self.algo {
+            Alg::Dqn | Alg::Ppo => self.head(self.features(inp)),
+            Alg::Rainbow => {
+                let dev = inp.device();
+                let n = inp.dims()[0];
+                let vals: Vec<f32> = (0..RAINBOW_ATOMS)
+                    .map(|idx| {
+                        RAINBOW_MIN
+                            + idx as f32 * (RAINBOW_MAX - RAINBOW_MIN) / (RAINBOW_ATOMS - 1) as f32
+                    })
+                    .collect();
+                let support: Tensor<3> =
+                    Tensor::from_data(TensorData::new(vals, [1, 1, RAINBOW_ATOMS]), &dev);
+                (softmax(self.rainbow_logits(inp), 2) * support)
+                    .sum_dim(2)
+                    .reshape([n, self.n_actions()])
+            }
+            Alg::Iqn => {
+                let n = inp.dims()[0];
+                let taus: Vec<f32> = (0..n)
+                    .flat_map(|_| {
+                        (0..IQN_EVAL_QUANTILES)
+                            .map(|idx| (idx as f32 + 0.5) / IQN_EVAL_QUANTILES as f32)
+                    })
+                    .collect();
+                self.forward_iqn(inp, &taus, IQN_EVAL_QUANTILES)
+                    .mean_dim(1)
+                    .reshape([n, self.n_actions()])
+            }
         }
     }
 
@@ -83,6 +220,7 @@ impl DQN {
             ("hidden", Some(&self.hidden)),
             ("output", Some(&self.output)),
             ("value", self.val.as_ref()),
+            ("quantile", self.quantile.as_ref()),
         ] {
             if let Some(layer) = linear {
                 put(
@@ -110,12 +248,8 @@ impl DQN {
             )?);
             used += 1;
             if let Some(bias) = &mut conv.bias {
-                *bias = Param::from_tensor(get(
-                    wts,
-                    &format!("{name}.bias"),
-                    bias.val().dims(),
-                    dev,
-                )?);
+                *bias =
+                    Param::from_tensor(get(wts, &format!("{name}.bias"), bias.val().dims(), dev)?);
                 used += 1;
             }
         }
@@ -123,15 +257,12 @@ impl DQN {
             ("hidden", Some(&mut self.hidden)),
             ("output", Some(&mut self.output)),
             ("value", self.val.as_mut()),
+            ("quantile", self.quantile.as_mut()),
         ] {
             if let Some(layer) = linear {
                 let dims: [usize; 2] = layer.weight.val().dims();
-                let tensor: Tensor<2> = get(
-                    wts,
-                    &format!("{name}.weight"),
-                    [dims[1], dims[0]],
-                    dev,
-                )?;
+                let tensor: Tensor<2> =
+                    get(wts, &format!("{name}.weight"), [dims[1], dims[0]], dev)?;
                 layer.weight = Param::from_tensor(tensor.transpose());
                 used += 1;
                 if let Some(bias) = &mut layer.bias {
@@ -161,13 +292,7 @@ fn put<const D: usize>(out: &mut Weights, name: &str, tensor: Tensor<D>) -> Resu
         vals.iter().all(|val: &f32| val.is_finite()),
         "Nonfinite tensor {name}"
     );
-    out.insert(
-        name.to_owned(),
-        Weight {
-            shape,
-            values: vals,
-        },
-    );
+    out.insert(name.to_owned(), Weight { shape, vals });
     Ok(())
 }
 
@@ -182,12 +307,12 @@ fn get<const D: usize>(
         .ok_or_else(|| anyhow::anyhow!("Missing tensor {name}"))?;
     ensure!(
         weight.shape == shape
-            && weight.values.len() == shape.iter().product::<usize>()
-            && weight.values.iter().all(|val: &f32| val.is_finite()),
+            && weight.vals.len() == shape.iter().product::<usize>()
+            && weight.vals.iter().all(|val: &f32| val.is_finite()),
         "Invalid tensor {name}"
     );
     Ok(Tensor::from_data(
-        TensorData::new(weight.values.clone(), shape),
+        TensorData::new(weight.vals.clone(), shape),
         dev,
     ))
 }

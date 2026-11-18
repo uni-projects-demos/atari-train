@@ -14,8 +14,8 @@ const MAX_SCREEN_DIMENSION: i32 = 1024;
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Info {
     pub reward: f32,
-    pub done: i32,
-    pub truncated: i32,
+    pub is_done: i32,
+    pub is_truncated: i32,
     pub lives: i32,
     pub width: i32,
     pub height: i32,
@@ -48,7 +48,7 @@ unsafe extern "C" {
         handle: *mut c_void,
         action: i32,
         repeat: u32,
-        pool: i32,
+        is_pool: i32,
         rgb: *mut u8,
         cap: usize,
         ram: *mut u8,
@@ -137,11 +137,11 @@ impl Ale {
         self.call(None)
     }
 
-    pub fn step(&mut self, action: usize, repeat: u32, pool: bool) -> Result<Info, String> {
+    pub fn step(&mut self, action: usize, repeat: u32, is_pool: bool) -> Result<Info, String> {
         if action >= self.acts.len() || !(1..=60).contains(&repeat) {
             return Err("Invalid minimal action or frame repeat".to_owned());
         }
-        self.call(Some((action, repeat, pool)))
+        self.call(Some((action, repeat, is_pool)))
     }
 
     fn call(&mut self, action: Option<(usize, u32, bool)>) -> Result<Info, String> {
@@ -149,13 +149,13 @@ impl Ale {
         let mut err: [c_char; ERROR_BYTES] = [0; ERROR_BYTES];
         let res: i32 = unsafe {
             match action {
-                Some((action, repeat, pool)) => {
+                Some((action, repeat, is_pool)) => {
                     let action: i32 = i32::try_from(action).expect("ALE action index fits i32");
                     rl_ale_step(
                         self.handle.as_ptr(),
                         action,
                         repeat,
-                        i32::from(pool),
+                        i32::from(is_pool),
                         self.rgb.as_mut_ptr(),
                         self.rgb.len(),
                         self.ram.as_mut_ptr(),

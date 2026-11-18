@@ -19,6 +19,9 @@ impl State {
     }
 
     pub fn elements(&self) -> usize {
-        self.frames.iter().map(|frame: &Arc<[u8]>| frame.len()).sum()
+        self.frames
+            .iter()
+            .map(|frame: &Arc<[u8]>| frame.len())
+            .sum()
     }
 }
